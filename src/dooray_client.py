@@ -1,13 +1,15 @@
 """Dooray 출/퇴근(working-times) API 클라이언트.
 
-기존 `working_times.py`의 동작을 변경하지 않고, HTTP API 서버에서도 재사용할 수 있도록 로직만 분리한다.
+쿠키 캐싱을 통해 매 요청마다 로그인하지 않고 빠르게 처리.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
+from typing import Optional
 
 import httpx
 from playwright.async_api import BrowserContext, Page, async_playwright
@@ -17,6 +19,13 @@ from src.utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+
+
+# 쿠키 캐시 (TTL: 30분)
+_COOKIE_CACHE_TTL = 30 * 60  # 초
+_cached_cookies: Optional[dict] = None
+_cookie_cached_at: float = 0
+_cookie_lock = asyncio.Lock()
 
 
 @dataclass(frozen=True)
@@ -33,70 +42,147 @@ def build_endpoints() -> DoorayEndpoints:
   return DoorayEndpoints(login_url=login_url, origin=origin, working_times_api_url=working_times_api_url)
 
 
-async def login_to_dooray(page: Page, context: BrowserContext, endpoints: DoorayEndpoints) -> tuple[bool, list[dict]]:
-  """Dooray 로그인 및 쿠키 획득."""
-  try:
-    await page.goto(endpoints.login_url)
-    logger.info("Dooray 로그인 페이지 로드 완료")
+def _is_cookie_valid() -> bool:
+  """캐시된 쿠키가 유효한지 확인."""
+  if not _cached_cookies:
+    return False
+  return (time.time() - _cookie_cached_at) < _COOKIE_CACHE_TTL
 
-    await page.wait_for_timeout(2000)
 
-    await page.focus("input[id=subdomain]")
-    await page.type("input[id=subdomain]", settings.DOORAY_SUBDOMAIN, delay=100)
-    await page.click("button[type=button]")
-    await asyncio.sleep(2)
-    await page.wait_for_timeout(2000)
+def _invalidate_cookie_cache() -> None:
+  """쿠키 캐시 무효화."""
+  global _cached_cookies, _cookie_cached_at
+  _cached_cookies = None
+  _cookie_cached_at = 0
+  logger.info("쿠키 캐시 무효화됨")
 
-    username = settings.DOORAY_LOGIN_USERNAME
-    password = settings.DOORAY_LOGIN_PASSWORD
 
-    if not username or not password:
-      logger.error("DOORAY_LOGIN_USERNAME 또는 DOORAY_LOGIN_PASSWORD가 설정되지 않았습니다.")
-      return False, []
-
-    await page.focus("input[type=text]")
-    await page.type("input[type=text]", username, delay=100)
-    await page.focus("input[type=password]")
-    await page.type("input[type=password]", password, delay=100)
-    await page.click("button[type=submit]")
-
+async def _login_and_get_cookies(endpoints: DoorayEndpoints) -> dict:
+  """Playwright로 로그인하고 쿠키 획득."""
+  async with async_playwright() as p:
+    browser = await p.chromium.launch(
+      headless=True,
+      args=["--disable-blink-features=AutomationControlled"]
+    )
     try:
-      await page.wait_for_load_state("load", timeout=15000)
-    except Exception:
-      await page.wait_for_timeout(3000)
+      context = await browser.new_context(
+        user_agent=(
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+        ),
+        bypass_csp=True,
+        viewport={"width": 1280, "height": 800},
+      )
+      page = await context.new_page()
 
-    await page.wait_for_timeout(2000)
+      # 로그인 페이지 이동
+      await page.goto(endpoints.login_url)
+      logger.info("Dooray 로그인 페이지 로드 완료")
 
-    try:
-      await page.goto(endpoints.origin, wait_until="load", timeout=30000)
-      await page.wait_for_timeout(5000)
+      await page.wait_for_timeout(1500)
 
+      # 서브도메인 입력
+      await page.focus("input[id=subdomain]")
+      await page.type("input[id=subdomain]", settings.DOORAY_SUBDOMAIN, delay=50)
+      await page.click("button[type=button]")
+      await page.wait_for_timeout(1500)
+
+      # 로그인 정보 입력
+      username = settings.DOORAY_LOGIN_USERNAME
+      password = settings.DOORAY_LOGIN_PASSWORD
+
+      if not username or not password:
+        raise ValueError("DOORAY_LOGIN_USERNAME 또는 DOORAY_LOGIN_PASSWORD가 설정되지 않았습니다.")
+
+      await page.focus("input[type=text]")
+      await page.type("input[type=text]", username, delay=50)
+      await page.focus("input[type=password]")
+      await page.type("input[type=password]", password, delay=50)
+      await page.click("button[type=submit]")
+
+      # 로그인 완료 대기
       try:
-        await page.wait_for_selector("body", timeout=10000)
+        await page.wait_for_load_state("load", timeout=10000)
       except Exception:
-        pass
-    except Exception as e:
-      logger.warning(f"Dooray 메인 페이지 이동 중 오류 (무시하고 진행): {e}")
-      await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(2000)
 
-    cookies = await context.cookies()
-    if cookies:
+      await page.wait_for_timeout(1500)
+
+      # 메인 페이지로 이동해서 쿠키 확보
+      try:
+        await page.goto(endpoints.origin, wait_until="load", timeout=15000)
+        await page.wait_for_timeout(2000)
+      except Exception as e:
+        logger.warning(f"메인 페이지 이동 중 오류 (무시): {e}")
+
+      cookies = await context.cookies()
+      if not cookies:
+        raise ValueError("쿠키를 획득하지 못했습니다.")
+
       logger.info(f"로그인 성공 (쿠키 {len(cookies)}개 획득)")
-      return True, cookies
+      return {c["name"]: c["value"] for c in cookies}
 
-    logger.warning("쿠키를 획득하지 못했습니다.")
-    return False, []
-  except Exception as e:
-    logger.error(f"로그인 실패: {e}")
-    return False, []
+    finally:
+      await browser.close()
 
 
-def cookies_to_httpx_dict(cookies: list[dict]) -> dict:
-  """Playwright 쿠키를 httpx용 쿠키 딕셔너리로 변환."""
-  cookie_dict: dict[str, str] = {}
-  for cookie in cookies:
-    cookie_dict[cookie["name"]] = cookie["value"]
-  return cookie_dict
+async def _get_cookies(endpoints: DoorayEndpoints, force_refresh: bool = False) -> dict:
+  """쿠키 획득 (캐시 사용)."""
+  global _cached_cookies, _cookie_cached_at
+
+  async with _cookie_lock:
+    if not force_refresh and _is_cookie_valid():
+      logger.debug("캐시된 쿠키 사용")
+      return _cached_cookies
+
+    logger.info("새로운 쿠키 획득 중...")
+    _cached_cookies = await _login_and_get_cookies(endpoints)
+    _cookie_cached_at = time.time()
+    return _cached_cookies
+
+
+async def _call_attendance_api(
+  endpoints: DoorayEndpoints,
+  cookie_dict: dict,
+  base_date: str,
+  attendance_type: str
+) -> tuple[dict, bool]:
+  """출/퇴근 API 호출. (성공 여부와 함께 반환)"""
+  request_payload = {"baseDate": base_date, "attendanceType": attendance_type}
+  type_name = "출근" if attendance_type == "ENTER" else "퇴근"
+
+  logger.info(f"{type_name} API 호출: {base_date}")
+
+  async with httpx.AsyncClient(cookies=cookie_dict, timeout=30.0) as client:
+    response = await client.post(
+      endpoints.working_times_api_url,
+      json=request_payload,
+      headers={
+        "Content-Type": "application/json",
+        "Referer": f"{endpoints.origin}/",
+        "Origin": endpoints.origin,
+      },
+    )
+
+    logger.info(f"응답 상태 코드: {response.status_code}")
+
+    # 401/403이면 쿠키 만료
+    if response.status_code in (401, 403):
+      return {"error": "인증 실패"}, False
+
+    try:
+      result = response.json()
+    except json.JSONDecodeError:
+      result = {
+        "error": "JSON 파싱 실패",
+        "status_code": response.status_code,
+        "response_text": response.text[:500],
+      }
+
+    if response.status_code != 200:
+      result["status_code"] = response.status_code
+
+    return result, True
 
 
 async def request_attendance(base_date: str, attendance_type: str) -> dict:
@@ -105,63 +191,26 @@ async def request_attendance(base_date: str, attendance_type: str) -> dict:
   Args:
     base_date: 기준 날짜 (YYYY-MM-DD 형식)
     attendance_type: "ENTER" 또는 "LEAVE"
+
+  Returns:
+    API 응답 딕셔너리
   """
   endpoints = build_endpoints()
 
-  async with async_playwright() as p:
-    browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-    context = await browser.new_context(
-      user_agent=(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
-      ),
-      bypass_csp=True,
-      viewport={"width": 1280, "height": 800},
-    )
-    page = await context.new_page()
-
-    login_success, cookies = await login_to_dooray(page, context, endpoints)
-    if not login_success:
-      await browser.close()
-      return {"error": "로그인 실패"}
-
-    cookie_dict = cookies_to_httpx_dict(cookies)
-    await browser.close()
-
-  request_payload = {"baseDate": base_date, "attendanceType": attendance_type}
-  type_name = "출근" if attendance_type == "ENTER" else "퇴근"
-  logger.info(f"{type_name} 요청 API 호출: {endpoints.working_times_api_url}")
-  logger.info(f"요청 본문: {json.dumps(request_payload, ensure_ascii=False)}")
-
   try:
-    async with httpx.AsyncClient(cookies=cookie_dict, timeout=30.0) as client:
-      response = await client.post(
-        endpoints.working_times_api_url,
-        json=request_payload,
-        headers={
-          "Content-Type": "application/json",
-          "Referer": f"{endpoints.origin}/",
-          "Origin": endpoints.origin,
-        },
-      )
+    # 캐시된 쿠키로 시도
+    cookie_dict = await _get_cookies(endpoints, force_refresh=False)
+    result, success = await _call_attendance_api(endpoints, cookie_dict, base_date, attendance_type)
 
-      logger.info(f"응답 상태 코드: {response.status_code}")
+    # 인증 실패 시 쿠키 갱신 후 재시도
+    if not success:
+      logger.warning("인증 실패, 쿠키 갱신 후 재시도")
+      _invalidate_cookie_cache()
+      cookie_dict = await _get_cookies(endpoints, force_refresh=True)
+      result, _ = await _call_attendance_api(endpoints, cookie_dict, base_date, attendance_type)
 
-      try:
-        result = response.json()
-        logger.info(f"응답 본문: {json.dumps(result, ensure_ascii=False, indent=2)}")
-      except json.JSONDecodeError:
-        result = {
-          "error": "JSON 파싱 실패",
-          "status_code": response.status_code,
-          "response_text": response.text[:500],
-        }
-        logger.error(f"응답 본문 (JSON 파싱 실패): {response.text[:500]}")
+    return result
 
-      if response.status_code != 200:
-        result["status_code"] = response.status_code
-
-      return result
   except httpx.TimeoutException:
     logger.error("API 요청 타임아웃")
     return {"error": "타임아웃"}
@@ -169,6 +218,5 @@ async def request_attendance(base_date: str, attendance_type: str) -> dict:
     logger.error(f"API 요청 실패: {e}")
     return {"error": str(e)}
   except Exception as e:
-    logger.error(f"API 호출 중 예외 발생: {e}")
+    logger.error(f"API 호출 중 예외 발생: {e}", exc_info=True)
     return {"error": str(e)}
-
