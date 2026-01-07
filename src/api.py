@@ -1,11 +1,12 @@
 """Dooray 출/퇴근 API 서버.
 
-- Dooray 슬래시 커맨드 형식 지원
+- Dooray 슬래시 커맨드 형식 지원 (JSON 및 form-urlencoded)
 - 날짜를 주지 않으면 Asia/Seoul 기준 "오늘"로 처리
 """
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -80,9 +81,66 @@ def _dooray_response(success: bool, message: str, result: dict | None = None) ->
       text = f"{message}\n결과: {header.get('resultMessage', '알 수 없는 오류')}"
   
   return {
-    "responseType": "ephemeral",  # 채널에 표시 (ephemeral: 본인만 보임)
+    "responseType": "ephemeral",
     "text": text
   }
+
+
+async def _parse_dooray_request(request: Request) -> dict:
+  """Dooray 요청 파싱 (JSON 또는 form-urlencoded 모두 지원)."""
+  content_type = request.headers.get("content-type", "")
+  
+  # JSON 형식
+  if "application/json" in content_type:
+    try:
+      body = await request.json()
+      logger.info(f"JSON 요청 수신: {body}")
+      return body
+    except Exception as e:
+      logger.warning(f"JSON 파싱 실패: {e}")
+      return {}
+  
+  # form-urlencoded 형식
+  if "application/x-www-form-urlencoded" in content_type:
+    try:
+      form = await request.form()
+      body = dict(form)
+      logger.info(f"Form 요청 수신: {body}")
+      return body
+    except Exception as e:
+      logger.warning(f"Form 파싱 실패: {e}")
+      return {}
+  
+  # Content-Type이 없거나 다른 경우, 둘 다 시도
+  try:
+    raw_body = await request.body()
+    if not raw_body:
+      logger.warning("요청 본문이 비어있습니다.")
+      return {}
+    
+    # JSON 시도
+    try:
+      body = json.loads(raw_body.decode("utf-8"))
+      logger.info(f"Raw JSON 요청 수신: {body}")
+      return body
+    except json.JSONDecodeError:
+      pass
+    
+    # form-urlencoded 시도 (key=value&key2=value2 형식)
+    try:
+      from urllib.parse import parse_qs
+      parsed = parse_qs(raw_body.decode("utf-8"))
+      body = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+      logger.info(f"Raw Form 요청 수신: {body}")
+      return body
+    except Exception:
+      pass
+    
+    logger.warning(f"알 수 없는 요청 형식: {raw_body[:200]}")
+    return {}
+  except Exception as e:
+    logger.warning(f"요청 파싱 실패: {e}")
+    return {}
 
 
 async def _process_attendance(attendance_type: str, base_date: str, user_name: str | None) -> dict:
@@ -131,11 +189,15 @@ async def dooray_command(request: Request) -> dict:
   /출근 또는 /퇴근 커맨드를 하나의 URL로 처리합니다.
   RequestUrl에 이 엔드포인트를 등록하세요.
   """
+  body = await _parse_dooray_request(request)
+  
+  if not body:
+    return {"responseType": "ephemeral", "text": "요청 본문이 비어있거나 파싱할 수 없습니다."}
+  
   try:
-    body = await request.json()
     data = DoorayCommandRequest(**body)
   except Exception as e:
-    logger.warning(f"요청 파싱 실패: {e}")
+    logger.warning(f"모델 변환 실패: {e}")
     return {"responseType": "ephemeral", "text": f"요청 형식 오류: {e}"}
   
   command = (data.command or "").strip()
@@ -159,13 +221,17 @@ async def dooray_command(request: Request) -> dict:
 @app.post("/enter")
 async def enter(request: Request) -> dict:
   """출근(ENTER) - Dooray 슬래시 커맨드 또는 직접 호출."""
-  try:
-    body = await request.json()
-    data = DoorayCommandRequest(**body)
-    base_date = _extract_date_from_text(data.text)
-    user_name = data.userName
-  except Exception:
-    # Dooray 형식이 아닌 직접 호출
+  body = await _parse_dooray_request(request)
+  
+  if body:
+    try:
+      data = DoorayCommandRequest(**body)
+      base_date = _extract_date_from_text(data.text)
+      user_name = data.userName
+    except Exception:
+      base_date = _today_yyyy_mm_dd()
+      user_name = None
+  else:
     base_date = _today_yyyy_mm_dd()
     user_name = None
   
@@ -175,13 +241,17 @@ async def enter(request: Request) -> dict:
 @app.post("/leave")
 async def leave(request: Request) -> dict:
   """퇴근(LEAVE) - Dooray 슬래시 커맨드 또는 직접 호출."""
-  try:
-    body = await request.json()
-    data = DoorayCommandRequest(**body)
-    base_date = _extract_date_from_text(data.text)
-    user_name = data.userName
-  except Exception:
-    # Dooray 형식이 아닌 직접 호출
+  body = await _parse_dooray_request(request)
+  
+  if body:
+    try:
+      data = DoorayCommandRequest(**body)
+      base_date = _extract_date_from_text(data.text)
+      user_name = data.userName
+    except Exception:
+      base_date = _today_yyyy_mm_dd()
+      user_name = None
+  else:
     base_date = _today_yyyy_mm_dd()
     user_name = None
   
