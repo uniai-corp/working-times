@@ -7,15 +7,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
 
-import httpx
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
 from src.config import settings
@@ -79,97 +77,6 @@ def _dooray_response(message: str, response_type: str = "ephemeral") -> dict:
   }
 
 
-async def _send_to_response_url(
-  response_url: str,
-  channel_id: str | None,
-  message: str,
-  response_type: str = "inChannel"
-) -> None:
-  """responseUrl로 결과 메시지 전송.
-  
-  Dooray Slash Command responseUrl 형식:
-  - responseType: "ephemeral" (본인만) 또는 "inChannel" (전체)
-  - text: 메시지
-  - replaceOriginal: 원본 메시지 대체 여부
-  
-  Note: Slash Command responseUrl은 채널이 이미 지정되어 있어 channelId 불필요
-  """
-  if not response_url:
-    logger.warning("responseUrl이 없어서 결과를 전송할 수 없습니다.")
-    return
-
-  # Dooray Incoming Webhook 형식 (channelId 필수)
-  # attachments 형식을 사용해야 채널에 메시지가 보임
-  payload = {
-    "channelId": channel_id,
-    "botName": "출퇴근봇",
-    "text": message
-  }
-
-  logger.info(f"responseUrl로 전송할 payload: {payload}")
-
-  try:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-      response = await client.post(
-        response_url,
-        json=payload,
-        headers={"Content-Type": "application/json"}
-      )
-      logger.info(f"responseUrl 전송: status={response.status_code}, body={response.text[:200]}")
-      
-      # 첫 시도 실패 시 attachments 형식으로 재시도
-      if response.status_code != 200:
-        payload_attach = {
-          "channelId": channel_id,
-          "botName": "출퇴근봇",
-          "attachments": [
-            {
-              "title": "출퇴근 알림",
-              "text": message,
-              "color": "green"
-            }
-          ]
-        }
-        logger.info(f"attachments 형식으로 재시도: {payload_attach}")
-        response2 = await client.post(
-          response_url,
-          json=payload_attach,
-          headers={"Content-Type": "application/json"}
-        )
-        logger.info(f"재시도 결과: status={response2.status_code}, body={response2.text[:200]}")
-  except Exception as e:
-    logger.error(f"responseUrl 전송 실패: {e}")
-
-
-async def _process_attendance_async(
-  attendance_type: str,
-  base_date: str,
-  user_email: str | None,
-  response_url: str | None,
-  channel_id: str | None
-) -> None:
-  """백그라운드에서 출/퇴근 처리 후 결과를 responseUrl로 전송."""
-  type_name = "출근" if attendance_type == "ENTER" else "퇴근"
-  user_display = user_email.split("@")[0] if user_email else "사용자"
-
-  logger.info(f"[백그라운드] {type_name} 처리 시작: user={user_display}, base_date={base_date}")
-
-  try:
-    result = await request_attendance(base_date, attendance_type)
-
-    header = result.get("header", {})
-    if header.get("isSuccessful"):
-      message = f"{user_display}님, {base_date} {type_name} 처리가 완료되었습니다."
-    else:
-      error_msg = header.get("resultMessage", "알 수 없는 오류")
-      message = f"{user_display}님, {type_name} 처리 실패: {error_msg}"
-
-  except Exception as e:
-    logger.error(f"{type_name} 처리 중 오류: {e}", exc_info=True)
-    message = f"{type_name} 처리 중 오류가 발생했습니다: {str(e)}"
-
-  # responseUrl로 결과 전송 (channelId 필수)
-  await _send_to_response_url(response_url, channel_id, message, "inChannel")
 
 
 async def _parse_dooray_request(request: Request) -> dict:
@@ -232,12 +139,37 @@ async def health() -> dict:
   return {"ok": True}
 
 
+# 동기 처리 헬퍼
+async def _process_attendance_sync(
+  attendance_type: str,
+  base_date: str,
+  user_email: str | None
+) -> str:
+  """동기적으로 출/퇴근 처리 후 결과 메시지 반환."""
+  type_name = "출근" if attendance_type == "ENTER" else "퇴근"
+  user_display = user_email.split("@")[0] if user_email else "사용자"
+
+  try:
+    result = await request_attendance(base_date, attendance_type)
+
+    header = result.get("header", {})
+    if header.get("isSuccessful"):
+      return f"✅ {user_display}님, {base_date} {type_name} 완료!"
+    else:
+      error_msg = header.get("resultMessage", "알 수 없는 오류")
+      return f"❌ {type_name} 실패: {error_msg}"
+
+  except Exception as e:
+    logger.error(f"{type_name} 처리 중 오류: {e}", exc_info=True)
+    return f"❌ {type_name} 처리 중 오류: {str(e)}"
+
+
 # Dooray 슬래시 커맨드 통합 엔드포인트
 @app.post("/dooray")
-async def dooray_command(request: Request, background_tasks: BackgroundTasks) -> dict:
-  """Dooray 슬래시 커맨드 통합 처리.
+async def dooray_command(request: Request) -> dict:
+  """Dooray 슬래시 커맨드 통합 처리 (동기 방식).
 
-  즉시 "처리 중" 메시지를 반환하고, 백그라운드에서 처리 후 responseUrl로 결과 전송.
+  처리 완료 후 바로 결과를 반환합니다.
   """
   # 설정 검증
   error = _ensure_settings()
@@ -257,24 +189,18 @@ async def dooray_command(request: Request, background_tasks: BackgroundTasks) ->
   command = (data.command or "").strip()
   base_date = _extract_date_from_text(data.text)
   user_email = data.userEmail
-  response_url = data.responseUrl
-  channel_id = data.channelId
 
-  logger.info(f"Dooray 커맨드: command={command}, user={user_email}, date={base_date}, channelId={channel_id}")
+  logger.info(f"Dooray 커맨드: command={command}, user={user_email}, date={base_date}")
 
   if command in ("/출근", "/enter"):
-    # 백그라운드에서 처리
-    background_tasks.add_task(
-      _process_attendance_async, "ENTER", base_date, user_email, response_url, channel_id
-    )
-    return _dooray_response("출근 처리 중...")
+    # 동기 처리 후 바로 결과 반환
+    result_msg = await _process_attendance_sync("ENTER", base_date, user_email)
+    return _dooray_response(result_msg, "inChannel")
 
   elif command in ("/퇴근", "/leave"):
-    # 백그라운드에서 처리
-    background_tasks.add_task(
-      _process_attendance_async, "LEAVE", base_date, user_email, response_url, channel_id
-    )
-    return _dooray_response("퇴근 처리 중...")
+    # 동기 처리 후 바로 결과 반환
+    result_msg = await _process_attendance_sync("LEAVE", base_date, user_email)
+    return _dooray_response(result_msg, "inChannel")
 
   else:
     return _dooray_response(f"알 수 없는 명령어: {command}\n사용 가능: /출근, /퇴근")
@@ -282,8 +208,8 @@ async def dooray_command(request: Request, background_tasks: BackgroundTasks) ->
 
 # 개별 엔드포인트
 @app.post("/enter")
-async def enter(request: Request, background_tasks: BackgroundTasks) -> dict:
-  """출근(ENTER)"""
+async def enter(request: Request) -> dict:
+  """출근(ENTER) - 동기 처리"""
   error = _ensure_settings()
   if error:
     return _dooray_response(f"설정 오류: {error}")
@@ -295,28 +221,20 @@ async def enter(request: Request, background_tasks: BackgroundTasks) -> dict:
       data = DoorayCommandRequest(**body)
       base_date = _extract_date_from_text(data.text)
       user_email = data.userEmail
-      response_url = data.responseUrl
-      channel_id = data.channelId
     except Exception:
       base_date = _today_yyyy_mm_dd()
       user_email = None
-      response_url = None
-      channel_id = None
   else:
     base_date = _today_yyyy_mm_dd()
     user_email = None
-    response_url = None
-    channel_id = None
 
-  background_tasks.add_task(
-    _process_attendance_async, "ENTER", base_date, user_email, response_url, channel_id
-  )
-  return _dooray_response("출근 처리 중...")
+  result_msg = await _process_attendance_sync("ENTER", base_date, user_email)
+  return _dooray_response(result_msg, "inChannel")
 
 
 @app.post("/leave")
-async def leave(request: Request, background_tasks: BackgroundTasks) -> dict:
-  """퇴근(LEAVE)"""
+async def leave(request: Request) -> dict:
+  """퇴근(LEAVE) - 동기 처리"""
   error = _ensure_settings()
   if error:
     return _dooray_response(f"설정 오류: {error}")
@@ -328,20 +246,12 @@ async def leave(request: Request, background_tasks: BackgroundTasks) -> dict:
       data = DoorayCommandRequest(**body)
       base_date = _extract_date_from_text(data.text)
       user_email = data.userEmail
-      response_url = data.responseUrl
-      channel_id = data.channelId
     except Exception:
       base_date = _today_yyyy_mm_dd()
       user_email = None
-      response_url = None
-      channel_id = None
   else:
     base_date = _today_yyyy_mm_dd()
     user_email = None
-    response_url = None
-    channel_id = None
 
-  background_tasks.add_task(
-    _process_attendance_async, "LEAVE", base_date, user_email, response_url, channel_id
-  )
-  return _dooray_response("퇴근 처리 중...")
+  result_msg = await _process_attendance_sync("LEAVE", base_date, user_email)
+  return _dooray_response(result_msg, "inChannel")
