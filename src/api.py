@@ -87,25 +87,25 @@ async def _send_to_response_url(
 ) -> None:
   """responseUrl로 결과 메시지 전송.
   
-  Dooray responseUrl (Incoming Webhook) 형식:
-  - channelId: 필수
+  Dooray Slash Command responseUrl 형식:
   - responseType: "ephemeral" (본인만) 또는 "inChannel" (전체)
   - text: 메시지
+  - replaceOriginal: 원본 메시지 대체 여부
+  
+  Note: Slash Command responseUrl은 채널이 이미 지정되어 있어 channelId 불필요
   """
   if not response_url:
     logger.warning("responseUrl이 없어서 결과를 전송할 수 없습니다.")
     return
 
-  if not channel_id:
-    logger.warning("channelId가 없어서 결과를 전송할 수 없습니다.")
-    return
-
-  # Dooray Incoming Webhook 형식 (channelId 필수)
+  # Dooray Slash Command responseUrl 형식 (channelId 불필요)
   payload = {
-    "channelId": channel_id,
     "responseType": response_type,
-    "text": message
+    "text": message,
+    "replaceOriginal": False
   }
+
+  logger.info(f"responseUrl로 전송할 payload: {payload}")
 
   try:
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -115,6 +115,21 @@ async def _send_to_response_url(
         headers={"Content-Type": "application/json"}
       )
       logger.info(f"responseUrl 전송: status={response.status_code}, body={response.text[:200]}")
+      
+      # 실패 시 channelId 포함해서 재시도 (Incoming Webhook 형식)
+      if response.status_code != 200 and channel_id:
+        logger.info("Slash Command 형식 실패, Incoming Webhook 형식으로 재시도...")
+        payload_with_channel = {
+          "channelId": channel_id,
+          "responseType": response_type,
+          "text": message
+        }
+        response2 = await client.post(
+          response_url,
+          json=payload_with_channel,
+          headers={"Content-Type": "application/json"}
+        )
+        logger.info(f"재시도 전송: status={response2.status_code}, body={response2.text[:200]}")
   except Exception as e:
     logger.error(f"responseUrl 전송 실패: {e}")
 
