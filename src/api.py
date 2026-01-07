@@ -1,31 +1,82 @@
 """Dooray 출/퇴근 API 서버.
 
 - Dooray 슬래시 커맨드 형식 지원 (JSON 및 form-urlencoded)
-- 비동기 응답: 즉시 "처리 중" 반환 후, responseUrl로 결과 전송
+- 동기 방식: 처리 완료 후 바로 결과 반환
 - 날짜를 주지 않으면 Asia/Seoul 기준 "오늘"로 처리
+- 스케줄러: 7:40 AM / 4:40 PM 쿠키 워밍업
 """
 
 from __future__ import annotations
 
 import json
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from src.config import settings
-from src.dooray_client import request_attendance
+from src.dooray_client import request_attendance, warmup_cookies
 from src.utils.logger import setup_logger, get_logger
 
 
 setup_logger("working_times_api", log_file="logs/working_times_api.log")
 logger = get_logger(__name__)
 
-app = FastAPI(title="Dooray Working Times API", version="1.0.0")
+
+# 스케줄러 설정
+scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
+
+
+async def scheduled_warmup():
+  """스케줄된 쿠키 워밍업."""
+  logger.info("스케줄된 쿠키 워밍업 시작...")
+  success = await warmup_cookies()
+  if success:
+    logger.info("스케줄된 쿠키 워밍업 완료")
+  else:
+    logger.warning("스케줄된 쿠키 워밍업 실패")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+  """앱 시작/종료 시 스케줄러 관리."""
+  # 시작 시: 스케줄러 시작
+  # 오전 7:40 (출근 전)
+  scheduler.add_job(
+    scheduled_warmup,
+    CronTrigger(hour=7, minute=40),
+    id="warmup_morning",
+    replace_existing=True
+  )
+  # 오후 4:40 (퇴근 전)
+  scheduler.add_job(
+    scheduled_warmup,
+    CronTrigger(hour=16, minute=40),
+    id="warmup_afternoon",
+    replace_existing=True
+  )
+  scheduler.start()
+  logger.info("스케줄러 시작: 7:40 AM, 4:40 PM 쿠키 워밍업 예약됨")
+  
+  yield
+  
+  # 종료 시: 스케줄러 정리
+  scheduler.shutdown()
+  logger.info("스케줄러 종료")
+
+
+app = FastAPI(
+  title="Dooray Working Times API",
+  version="1.0.0",
+  lifespan=lifespan
+)
 
 _TZ = ZoneInfo("Asia/Seoul")
 _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -140,6 +191,32 @@ async def health() -> dict:
   return {"ok": True}
 
 
+@app.get("/warmup")
+async def warmup():
+  """수동으로 쿠키 워밍업 실행."""
+  logger.info("수동 쿠키 워밍업 요청")
+  success = await warmup_cookies()
+  if success:
+    return {"status": "success", "message": "쿠키 워밍업 완료"}
+  else:
+    return {"status": "failed", "message": "쿠키 워밍업 실패"}
+
+
+@app.get("/scheduler")
+async def scheduler_status():
+  """스케줄러 상태 확인."""
+  jobs = []
+  for job in scheduler.get_jobs():
+    jobs.append({
+      "id": job.id,
+      "next_run": job.next_run_time.isoformat() if job.next_run_time else None
+    })
+  return {
+    "running": scheduler.running,
+    "jobs": jobs
+  }
+
+
 # 동기 처리 헬퍼
 async def _process_attendance_sync(
   attendance_type: str,
@@ -149,13 +226,14 @@ async def _process_attendance_sync(
   """동기적으로 출/퇴근 처리 후 결과 메시지 반환."""
   type_name = "출근" if attendance_type == "ENTER" else "퇴근"
   user_display = user_email.split("@")[0] if user_email else "사용자"
+  current_time = datetime.now(_TZ).strftime("%H:%M:%S")
 
   try:
     result = await request_attendance(base_date, attendance_type)
 
     header = result.get("header", {})
     if header.get("isSuccessful"):
-      return f"✅ {user_display}님, {base_date} {type_name} 완료!"
+      return f"✅ {user_display}님, {base_date} {type_name} 완료!\n⏰ 처리 시간: {current_time}"
     else:
       error_msg = header.get("resultMessage", "알 수 없는 오류")
       return f"❌ {type_name} 실패: {error_msg}"

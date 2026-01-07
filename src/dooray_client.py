@@ -21,8 +21,8 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-# 쿠키 캐시 (TTL: 30분)
-_COOKIE_CACHE_TTL = 30 * 60
+# 쿠키 캐시 (TTL: 5시간)
+_COOKIE_CACHE_TTL = 5 * 60 * 60
 _cached_cookies: Optional[dict] = None
 _cookie_cached_at: float = 0
 _cookie_lock = asyncio.Lock()
@@ -196,6 +196,22 @@ async def _call_attendance_api(
       result["status_code"] = response.status_code
 
     return result, True
+
+
+async def warmup_cookies() -> bool:
+  """쿠키 미리 획득 (스케줄러용).
+  
+  Returns:
+    성공 여부
+  """
+  endpoints = build_endpoints()
+  try:
+    await _get_cookies(endpoints, force_refresh=True)
+    logger.info("쿠키 워밍업 완료")
+    return True
+  except Exception as e:
+    logger.error(f"쿠키 워밍업 실패: {e}")
+    return False
 
 
 async def request_attendance(base_date: str, attendance_type: str) -> dict:
