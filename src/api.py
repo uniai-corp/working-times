@@ -98,11 +98,12 @@ async def _send_to_response_url(
     logger.warning("responseUrl이 없어서 결과를 전송할 수 없습니다.")
     return
 
-  # Dooray Slash Command responseUrl 형식 (channelId 불필요)
+  # Dooray Incoming Webhook 형식 (channelId 필수)
+  # attachments 형식을 사용해야 채널에 메시지가 보임
   payload = {
-    "responseType": response_type,
-    "text": message,
-    "replaceOriginal": False
+    "channelId": channel_id,
+    "botName": "출퇴근봇",
+    "text": message
   }
 
   logger.info(f"responseUrl로 전송할 payload: {payload}")
@@ -116,20 +117,26 @@ async def _send_to_response_url(
       )
       logger.info(f"responseUrl 전송: status={response.status_code}, body={response.text[:200]}")
       
-      # 실패 시 channelId 포함해서 재시도 (Incoming Webhook 형식)
-      if response.status_code != 200 and channel_id:
-        logger.info("Slash Command 형식 실패, Incoming Webhook 형식으로 재시도...")
-        payload_with_channel = {
+      # 첫 시도 실패 시 attachments 형식으로 재시도
+      if response.status_code != 200:
+        payload_attach = {
           "channelId": channel_id,
-          "responseType": response_type,
-          "text": message
+          "botName": "출퇴근봇",
+          "attachments": [
+            {
+              "title": "출퇴근 알림",
+              "text": message,
+              "color": "green"
+            }
+          ]
         }
+        logger.info(f"attachments 형식으로 재시도: {payload_attach}")
         response2 = await client.post(
           response_url,
-          json=payload_with_channel,
+          json=payload_attach,
           headers={"Content-Type": "application/json"}
         )
-        logger.info(f"재시도 전송: status={response2.status_code}, body={response2.text[:200]}")
+        logger.info(f"재시도 결과: status={response2.status_code}, body={response2.text[:200]}")
   except Exception as e:
     logger.error(f"responseUrl 전송 실패: {e}")
 
