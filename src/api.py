@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 
 from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from src.config import settings
@@ -255,3 +256,196 @@ async def leave(request: Request) -> dict:
 
   result_msg = await _process_attendance_sync("LEAVE", base_date, user_email)
   return _dooray_response(result_msg, "inChannel")
+
+
+# ========================================
+# QR 코드 출퇴근 엔드포인트
+# ========================================
+
+
+def _html_response(title: str, message: str, success: bool = True) -> HTMLResponse:
+  """QR 스캔 결과를 보여주는 HTML 페이지."""
+  color = "#10b981" if success else "#ef4444"
+  icon = "✓" if success else "✗"
+  
+  html = f"""
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title}</title>
+  <style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      color: white;
+    }}
+    .container {{
+      text-align: center;
+      padding: 2rem;
+    }}
+    .icon {{
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      background: {color};
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 1.5rem;
+      font-size: 2.5rem;
+    }}
+    h1 {{
+      font-size: 1.5rem;
+      margin-bottom: 0.5rem;
+    }}
+    .message {{
+      font-size: 1.1rem;
+      color: #94a3b8;
+      line-height: 1.6;
+    }}
+    .time {{
+      margin-top: 1.5rem;
+      font-size: 0.9rem;
+      color: #64748b;
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">{icon}</div>
+    <h1>{title}</h1>
+    <p class="message">{message}</p>
+    <p class="time">{datetime.now(_TZ).strftime("%Y-%m-%d %H:%M:%S")}</p>
+  </div>
+</body>
+</html>
+"""
+  return HTMLResponse(content=html)
+
+
+@app.get("/qr/enter")
+async def qr_enter():
+  """QR 코드로 출근 처리 (GET 요청)."""
+  error = _ensure_settings()
+  if error:
+    return _html_response("설정 오류", error, success=False)
+
+  base_date = _today_yyyy_mm_dd()
+  result_msg = await _process_attendance_sync("ENTER", base_date, None)
+  
+  success = "완료" in result_msg
+  return _html_response("출근 처리", result_msg, success=success)
+
+
+@app.get("/qr/leave")
+async def qr_leave():
+  """QR 코드로 퇴근 처리 (GET 요청)."""
+  error = _ensure_settings()
+  if error:
+    return _html_response("설정 오류", error, success=False)
+
+  base_date = _today_yyyy_mm_dd()
+  result_msg = await _process_attendance_sync("LEAVE", base_date, None)
+  
+  success = "완료" in result_msg
+  return _html_response("퇴근 처리", result_msg, success=success)
+
+
+@app.get("/qr")
+async def qr_page(request: Request):
+  """QR 코드 페이지 (출근/퇴근 QR 표시)."""
+  # 요청의 host 정보로 base URL 생성
+  host = request.headers.get("host", "localhost:8000")
+  scheme = request.headers.get("x-forwarded-proto", "http")
+  base_url = f"{scheme}://{host}"
+  
+  enter_url = f"{base_url}/qr/enter"
+  leave_url = f"{base_url}/qr/leave"
+  
+  # QR 코드는 Google Charts API 또는 직접 생성
+  qr_enter = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={enter_url}"
+  qr_leave = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={leave_url}"
+  
+  html = f"""
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>출퇴근 QR 코드</title>
+  <style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100vh;
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      color: white;
+      padding: 2rem;
+    }}
+    h1 {{
+      text-align: center;
+      margin-bottom: 2rem;
+      font-size: 1.8rem;
+    }}
+    .qr-container {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 2rem;
+    }}
+    .qr-card {{
+      background: rgba(255,255,255,0.05);
+      border-radius: 16px;
+      padding: 2rem;
+      text-align: center;
+      border: 1px solid rgba(255,255,255,0.1);
+    }}
+    .qr-card img {{
+      border-radius: 8px;
+      margin-bottom: 1rem;
+    }}
+    .qr-card h2 {{
+      font-size: 1.3rem;
+      margin-bottom: 0.5rem;
+    }}
+    .qr-card.enter h2 {{ color: #10b981; }}
+    .qr-card.leave h2 {{ color: #f59e0b; }}
+    .qr-card p {{
+      font-size: 0.85rem;
+      color: #94a3b8;
+      word-break: break-all;
+    }}
+    .info {{
+      text-align: center;
+      margin-top: 2rem;
+      color: #64748b;
+      font-size: 0.9rem;
+    }}
+  </style>
+</head>
+<body>
+  <h1>출퇴근 QR 코드</h1>
+  <div class="qr-container">
+    <div class="qr-card enter">
+      <img src="{qr_enter}" alt="출근 QR">
+      <h2>출근</h2>
+      <p>{enter_url}</p>
+    </div>
+    <div class="qr-card leave">
+      <img src="{qr_leave}" alt="퇴근 QR">
+      <h2>퇴근</h2>
+      <p>{leave_url}</p>
+    </div>
+  </div>
+  <p class="info">스마트폰으로 QR 코드를 스캔하세요</p>
+</body>
+</html>
+"""
+  return HTMLResponse(content=html)
