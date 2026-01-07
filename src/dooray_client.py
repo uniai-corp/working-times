@@ -87,12 +87,20 @@ async def _login_and_get_cookies(endpoints: DoorayEndpoints) -> dict:
       # 서브도메인 입력 필드 대기 및 입력
       subdomain_input = page.locator("input[id=subdomain]")
       await subdomain_input.wait_for(state="visible", timeout=5000)
-      await subdomain_input.fill(settings.DOORAY_SUBDOMAIN)
-      await page.click("button[type=button]")
+      
+      # type()으로 입력해야 JavaScript 이벤트가 트리거되어 버튼이 활성화됨
+      await subdomain_input.click()
+      await subdomain_input.fill("")  # 기존 값 클리어
+      await page.keyboard.type(settings.DOORAY_SUBDOMAIN, delay=30)
+      
+      # Next 버튼이 활성화될 때까지 대기 후 클릭
+      next_button = page.locator("button[type=button]:not([disabled])")
+      await next_button.wait_for(state="visible", timeout=5000)
+      await next_button.click()
 
       # 로그인 폼 대기
       username_input = page.locator("input[type=text]")
-      await username_input.wait_for(state="visible", timeout=5000)
+      await username_input.wait_for(state="visible", timeout=10000)
 
       username = settings.DOORAY_LOGIN_USERNAME
       password = settings.DOORAY_LOGIN_PASSWORD
